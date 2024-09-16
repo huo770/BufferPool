@@ -1,32 +1,19 @@
-# Prerequisites
-*.d
+# 忽略所有文件
+*
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# 但不忽略 .h 和 .cpp 文件
+!*.h
+!*.cpp
 
-# Precompiled Headers
-*.gch
-*.pch
+# 不忽略文件夹，否则 .h 和 .cpp 文件也会被忽略
+!*/
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
+# 你可以根据项目情况调整是否需要忽略某些文件，比如忽略二进制文件
+# 忽略编译生成的可执行文件
 *.exe
 *.out
-*.app
+*.o
+
+# 忽略临时文件
+*.tmp
+*.log
