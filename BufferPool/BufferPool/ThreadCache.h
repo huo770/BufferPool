@@ -7,9 +7,11 @@ public:
 	//申请内存
 	void* Allocate(size_t size);
 	//释放内存
-	void* Deallocate(void* ptr, size_t size);
+	void Deallocate(void* ptr, size_t size);
 	//从中心缓存获取内存
-	void* FetchFromCentraCache(size_t size, size_t alignSize);
+	void* FetchFromCentralCache(size_t index, size_t size);
+	// 释放对象时，链表过长时，回收内存回到中心缓存
+	void ListTooLong(FreeList& list, size_t size);
 private:
 	//需要一个_freeList的哈希桶
 	FreeList _freeLists[NFREELIST];

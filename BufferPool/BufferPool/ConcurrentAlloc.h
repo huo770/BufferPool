@@ -1,21 +1,55 @@
 #pragma once
+
 #include "Common.h"
 #include "ThreadCache.h"
+#include "PageCache.h"
+#include "ObjectPool.h"
 
-//多个线程都来调用，那么每个线程如何获取到自己的ThreadCache呢？
-void* ConcurrentAlloc(size_t size)
+static void* ConcurrentAlloc(size_t size)
 {
-	if (pTLSThreadCache == nullptr)
+	if (size > MAX_BYTES)
 	{
-		pTLSThreadCache = new ThreadCache;
-	}
+		size_t alignSize = SizeClass::RoundUp(size);
+		size_t kpage = alignSize >> PAGE_SHIFT;
 
-	return pTLSThreadCache->Allocate(size);
+		PageCache::GetInstance()->_pageMtx.lock();
+		Span* span = PageCache::GetInstance()->NewSpan(kpage);
+		span->_objSize = size;
+		PageCache::GetInstance()->_pageMtx.unlock();
+
+		void* ptr = (void*)(span->_pageId << PAGE_SHIFT);
+		return ptr;
+	}
+	else
+	{
+		// 通过TLS 每个线程无锁的获取自己的专属的ThreadCache对象
+		if (pTLSThreadCache == nullptr)
+		{
+			static ObjectPool<ThreadCache> tcPool;
+			//pTLSThreadCache = new ThreadCache;
+			pTLSThreadCache = tcPool.New();
+		}
+
+		//cout << std::this_thread::get_id() << ":" << pTLSThreadCache << endl;
+
+		return pTLSThreadCache->Allocate(size);
+	}	
 }
 
-static void ConcurrentFree(void* ptr, size_t size)
+static void ConcurrentFree(void* ptr)
 {
-	assert(pTLSThreadCache);
+	Span* span = PageCache::GetInstance()->MapObjectToSpan(ptr);
+	size_t size = span->_objSize;
 
-	pTLSThreadCache->Deallocate(ptr, size);
+	if (size > MAX_BYTES)
+	{
+		PageCache::GetInstance()->_pageMtx.lock();
+		PageCache::GetInstance()->ReleaseSpanToPageCache(span);
+		PageCache::GetInstance()->_pageMtx.unlock();
+	}
+	else
+	{
+		assert(pTLSThreadCache);
+		pTLSThreadCache->Deallocate(ptr, size);
+	}
 }

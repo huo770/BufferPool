@@ -1,78 +1,137 @@
 #pragma once
-#include<iostream>
-#include<vector>
-#include<time.h>
-#include<assert.h>
-#include<thread>
-#include<mutex>
-#include <Windows.h>
+
+#include <iostream>
+#include <vector>
+#include <unordered_map>
+#include <map>
+#include <algorithm>
+
+#include <time.h>
+#include <assert.h>
+
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 using std::cout;
 using std::endl;
 
-//为什么使用static?是为了不改变 -- 尽量不使用宏
-static const size_t MAX_BYTES = 256 * 1024;
-static const size_t NFREELIST = 208;   //总共的哈希桶的数量
-static const size_t NPAGES = 128;
-static const size_t PAGE_SHIFT = 13;   //为什么是13，因为一页是8k， 2的13次方
-
 #ifdef _WIN32
-	typedef size_t PAGE_ID;
-#elif _WIN64
-	typedef unsigned long long PAGE_ID;
+	#include <windows.h>
+#else
+	// ...
 #endif
 
+static const size_t MAX_BYTES = 256 * 1024;
+static const size_t NFREELIST = 208;
+static const size_t NPAGES = 129;
+static const size_t PAGE_SHIFT = 13;
 
-	//直接去堆上按页申请空间
+#ifdef _WIN64
+	typedef unsigned long long PAGE_ID;
+#elif _WIN32
+	typedef size_t PAGE_ID;
+#else
+	// linux
+#endif
+
+// 直接去堆上按页申请空间
 inline static void* SystemAlloc(size_t kpage)
 {
 #ifdef _WIN32
 	void* ptr = VirtualAlloc(0, kpage << 13, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-		//linux下用mmp或者brk
+	// linux下brk mmap等
 #endif
+
 	if (ptr == nullptr)
 		throw std::bad_alloc();
 
 	return ptr;
 }
 
-//封装一个函数，取前4/8字节的大小
+
+inline static void SystemFree(void* ptr)
+{
+#ifdef _WIN32
+	VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+	// sbrk unmmap等
+#endif
+}
+
 static void*& NextObj(void* obj)
 {
 	return *(void**)obj;
 }
-//管理切分好的小对象的自由链表
+
+
+// 管理切分好的小对象的自由链表
 class FreeList
 {
 public:
-	//插入一个对象
 	void Push(void* obj)
 	{
-		//头插
-		NextObj(obj) = _freeList;  //等价于obj->next = _freeList
+		assert(obj);
+
+		// 头插
+		//*(void**)obj = _freeList;
+		NextObj(obj) = _freeList;
 		_freeList = obj;
+
+		++_size;
 	}
-	
-	//批量插入freelist,头插
-	void PushRange(void* start, void* end)
+
+	void PushRange(void* start, void* end, size_t n)
 	{
 		NextObj(end) = _freeList;
 		_freeList = start;
+
+		// 测试验证+条件断点
+		/*int i = 0;
+		void* cur = start;
+		while (cur)
+		{
+			cur = NextObj(cur);
+			++i;
+		}
+
+		if (n != i)
+		{
+			int x = 0;
+		}*/
+
+		_size += n;
 	}
-	//从自由链表中删除内存
+
+	void PopRange(void*& start, void*& end, size_t n)
+	{
+		assert(n <= _size);
+		start = _freeList;
+		end = start;
+
+		for (size_t i = 0; i < n - 1; ++i)
+		{
+			end = NextObj(end);
+		}
+
+		_freeList = NextObj(end);
+		NextObj(end) = nullptr;
+		_size -= n;
+	}
+
 	void* Pop()
 	{
 		assert(_freeList);
-		//头删
-		void* obj = _freeList;
-		_freeList = NextObj(obj);   //等价于_freeList = obj->next 
 
-		//头删，指向下一个，所以返回obj
+		// 头删
+		void* obj = _freeList;
+		_freeList = NextObj(obj);
+		--_size;
+
 		return obj;
 	}
-	
-	//判断是否为空
+
 	bool Empty()
 	{
 		return _freeList == nullptr;
@@ -82,170 +141,184 @@ public:
 	{
 		return _maxSize;
 	}
+
+	size_t Size()
+	{
+		return _size;
+	}
+
 private:
 	void* _freeList = nullptr;
 	size_t _maxSize = 1;
+	size_t _size = 0;
 };
 
-
-//计算对象大小的对齐映射规则
+// 计算对象大小的对齐映射规则
 class SizeClass
 {
 public:
-	//子函数
-	//size_t _RoundUp(size_t size, size_t AlignNum)
-	//{
-	//	size_t alignSize;
-	//	if (size % AlignNum != 0)
-	//	{
-	//		alignSize = (size / AlignNum + 1) * AlignNum;
-	//	}
-	//	else
-	//	{
-	//		alignSize = size;
-	//	}
+	// 整体控制在最多10%左右的内碎片浪费
+	// [1,128]					8byte对齐	    freelist[0,16)
+	// [128+1,1024]				16byte对齐	    freelist[16,72)
+	// [1024+1,8*1024]			128byte对齐	    freelist[72,128)
+	// [8*1024+1,64*1024]		1024byte对齐     freelist[128,184)
+	// [64*1024+1,256*1024]		8*1024byte对齐   freelist[184,208)
 
-	//	return alignSize;
-	//}
+	/*size_t _RoundUp(size_t size, size_t alignNum)
+	{
+		size_t alignSize;
+		if (size % alignNum != 0)
+		{
+			alignSize = (size / alignNum + 1)*alignNum;
+		}
+		else
+		{
+			alignSize = size;
+		}
 
-	//计算给定字节数，根据内存对齐规则，最终应该返回的字节数
+		return alignSize;
+	}*/
+	// 1-8 
 	static inline size_t _RoundUp(size_t bytes, size_t alignNum)
 	{
-		return ((bytes + (alignNum)-1) & ~(alignNum - 1));
+		return ((bytes + alignNum - 1) & ~(alignNum - 1));
 	}
 
-	//对齐规则：
-	static size_t RoundUp(size_t size)
+	static inline size_t RoundUp(size_t size)
 	{
 		if (size <= 128)
 		{
-			return _RoundUp(size, 8);   //八字节对齐
+			return _RoundUp(size, 8);
 		}
 		else if (size <= 1024)
 		{
 			return _RoundUp(size, 16);
 		}
-		else if (size <= 8 * 1024)
+		else if (size <= 8*1024)
 		{
 			return _RoundUp(size, 128);
 		}
-		else if (size <= 64 * 1024)
+		else if (size <= 64*1024)
 		{
 			return _RoundUp(size, 1024);
 		}
 		else if (size <= 256 * 1024)
 		{
-			return _RoundUp(size, 8 * 1024);
+			return _RoundUp(size, 8*1024);
 		}
 		else
 		{
-			assert(size);
+			return _RoundUp(size, 1<<PAGE_SHIFT);
 		}
-
 	}
 
-	//static inline size_t _Index(size_t bytes, size_t alignNum)
-	//{
-	//	if (bytes % alignNum == 0)
-	//	{
-	//		return bytes / alignNum - 1;
-	//	}
-	//	else
-	//	{
-	//		return bytes / alignNum;
-	//	}
-	//}
+	/*size_t _Index(size_t bytes, size_t alignNum)
+	{
+	if (bytes % alignNum == 0)
+	{
+	return bytes / alignNum - 1;
+	}
+	else
+	{
+	return bytes / alignNum;
+	}
+	}*/
 
+	// 1 + 7  8
+	// 2      9
+	// ...
+	// 8      15
+	
+	// 9 + 7 16
+	// 10
+	// ...
+	// 16    23
 	static inline size_t _Index(size_t bytes, size_t align_shift)
 	{
-		return ((bytes + (1 << align_shift) - 1) >> align_shift) + 1;
+		return ((bytes + (1 << align_shift) - 1) >> align_shift) - 1;
 	}
 
-	//计算映射的是哪一个自由链表桶
-	static inline size_t Index(size_t Bytes)
+	// 计算映射的哪一个自由链表桶
+	static inline size_t Index(size_t bytes)
 	{
-		assert(Bytes <= MAX_BYTES);
+		assert(bytes <= MAX_BYTES);
 
-		//对应的每一个分区有多少个桶
+		// 每个区间有多少个链
 		static int group_array[4] = { 16, 56, 56, 56 };
-		if (Bytes <= 128)
-		{
-			return _Index(Bytes, 3);
+		if (bytes <= 128){
+			return _Index(bytes, 3);
 		}
-		else if (Bytes <= 1024)
-		{
-			//根据不同的映射规则
-			//Bytes - 128表示在第二个区间有多少个字节
-			//加group_array[0]表示相对第一个区间的偏移量，第一个区间有16个桶，所以group_array[0] = 16
-			return _Index(Bytes - 128, 4) + group_array[0];
+		else if (bytes <= 1024){
+			return _Index(bytes - 128, 4) + group_array[0];
 		}
-		else if (Bytes <= 8 * 1024)
-		{
-			return _Index(Bytes - 8 * 1024, 7) + group_array[1] + group_array[0];
+		else if (bytes <= 8 * 1024){
+			return _Index(bytes - 1024, 7) + group_array[1] + group_array[0];
 		}
-		else if (Bytes <= 64 * 1024)
-		{
-			return _Index(Bytes - 64 * 1024, 10) + group_array[2] + group_array[1] + group_array[0];
+		else if (bytes <= 64 * 1024){
+			return _Index(bytes - 8 * 1024, 10) + group_array[2] + group_array[1] + group_array[0];
 		}
-		else if (Bytes <= 256 * 1024)
-		{
-			return _Index(Bytes - 256 * 1024, 13) + group_array[2] + group_array[2] +
-				group_array[1] + group_array[0];
+		else if (bytes <= 256 * 1024){
+			return _Index(bytes - 64 * 1024, 13) + group_array[3] + group_array[2] + group_array[1] + group_array[0];
 		}
+		else{
+			assert(false);
+		}
+
+		return -1;
 	}
 
-	static size_t NumMoveSize(size_t size)   //thread cache要的内存大小
+	// 一次thread cache从中心缓存获取多少个
+	static size_t NumMoveSize(size_t size)
 	{
 		assert(size > 0);
-		//[2, 512] 一次批量移动多少个对象的（慢启动)上限值
-		//小对象一次批量上限高
-		//大对象一次批量上限低
 
+		// [2, 512]，一次批量移动多少个对象的(慢启动)上限值
+		// 小对象一次批量上限高
+		// 小对象一次批量上限低
 		int num = MAX_BYTES / size;
 		if (num < 2)
-		{
 			num = 2;
-		}
-		
+
 		if (num > 512)
-		{
 			num = 512;
-		}
 
 		return num;
 	}
 
-	//计算一次向系统获取几个页
-	//单个对象 8byte
-	//....
-	//单个对象256byte
-	static size_t NumMovepage(size_t size)
+	// 计算一次向系统获取几个页
+	// 单个对象 8byte
+	// ...
+	// 单个对象 256KB
+	static size_t NumMovePage(size_t size)
 	{
 		size_t num = NumMoveSize(size);
-		size_t npage = num * size;   //npage表示算出来的字节数
+		size_t npage = num*size;
 
-		npage >>= PAGE_SHIFT;        //这里npage表示算出来的页数
+		npage >>= PAGE_SHIFT;
 		if (npage == 0)
 			npage = 1;
-		
+
 		return npage;
 	}
 };
 
-
+// 管理多个连续页大块内存跨度结构
 struct Span
 {
-	size_t _pageid = 0;      //大块内存起始页的也好
-	size_t _n = 0;            //页的数量
+	PAGE_ID _pageId = 0; // 大块内存起始页的页号
+	size_t  _n = 0;      // 页的数量
 
-	Span* _next = nullptr;         //双向链表的结构
+	Span* _next = nullptr;	// 双向链表的结构
 	Span* _prev = nullptr;
 
-	size_t _useCount = 0;    //切好小块内存，被分配给thread cache的计数
-	void* _freeList = nullptr;     //切好的小块内存的自由链表
+	size_t _objSize = 0;  // 切好的小对象的大小
+	size_t _useCount = 0; // 切好小块内存，被分配给thread cache的计数
+	void* _freeList = nullptr;  // 切好的小块内存的自由链表
+
+	bool _isUse = false;          // 是否在被使用
 };
 
-//带头双向循环链表
+// 带头双向循环链表 
 class SpanList
 {
 public:
@@ -270,6 +343,7 @@ public:
 	{
 		return _head->_next == _head;
 	}
+
 	void PushFront(Span* span)
 	{
 		Insert(Begin(), span);
@@ -281,32 +355,41 @@ public:
 		Erase(front);
 		return front;
 	}
-	//插入
+
 	void Insert(Span* pos, Span* newSpan)
 	{
 		assert(pos);
 		assert(newSpan);
 
 		Span* prev = pos->_prev;
-
+		// prev newspan pos
 		prev->_next = newSpan;
 		newSpan->_prev = prev;
 		newSpan->_next = pos;
 		pos->_prev = newSpan;
 	}
-	//删除
+
 	void Erase(Span* pos)
 	{
 		assert(pos);
 		assert(pos != _head);
+
+		// 1、条件断点
+		// 2、查看栈帧
+		/*if (pos == _head)
+		{
+		int x = 0;
+		}*/
+
 		Span* prev = pos->_prev;
 		Span* next = pos->_next;
 
 		prev->_next = next;
 		next->_prev = prev;
 	}
+
 private:
 	Span* _head;
 public:
-	std::mutex _mtx;      //桶锁，当两个线程访问同一个桶时，有竞争
+	std::mutex _mtx; // 桶锁
 };

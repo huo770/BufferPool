@@ -91,7 +91,7 @@ struct TreeNode
 	{}
 };
 
-void TestObjectPool()
+void Test1()
 {
 	// 申请释放的轮次
 	const size_t Rounds = 5;
@@ -140,3 +140,5 @@ void TestObjectPool()
 	cout << "系统自带的new cost time:" << end1 - begin1 << endl;
 	cout << "定长内存池的object pool cost time:" << end2 - begin2 << endl;
 }
+
+
